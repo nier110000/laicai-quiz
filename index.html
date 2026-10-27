@@ -80,6 +80,12 @@ label.ck{font-size:13px;color:var(--muted);user-select:none}
 .fb label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
 .fb input{width:100%;border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;font-size:13px;background:#fff;box-sizing:border-box}
 .fb input:focus{outline:none;border-color:var(--accent)}
+.fb-editor{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.fb-editor input{flex:1;min-width:160px;width:auto}
+.fb-editor button{white-space:nowrap}
+.fb-editor button:disabled{opacity:.55;cursor:default}
+.fb-status{width:100%;min-height:18px;font-size:12px;color:var(--muted)}
+.fb-status.error{color:var(--bad)}
 .res{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;box-shadow:0 1px 3px #0000000a;margin-bottom:14px}
 .res-head{display:flex;gap:20px;align-items:center;flex-wrap:wrap}
 .res-head h2{margin:0 0 4px;font-size:19px}
@@ -117,6 +123,14 @@ main.shell{max-width:1180px;display:flex;gap:16px;align-items:flex-start}
 #side .side-note{margin:14px 0 6px;font-size:13px;font-weight:700}
 #side .fb-line{font-size:12.5px;padding:8px 0;border-top:1px solid var(--line);line-height:1.5}
 #side .fb-line b{display:block;font-weight:600}
+#side .side-section+.side-section{border-top:1px solid var(--line);margin-top:12px;padding-top:12px}
+#side summary{cursor:pointer;line-height:1.6;overflow-wrap:anywhere}
+#side .side-section>summary{font-size:15px;font-weight:700;padding:4px 0}
+#side .side-section>summary .meta{font-weight:400;margin-left:6px}
+#side .side-content{margin-top:10px}
+#side .side-content.scroll{max-height:360px;overflow:auto}
+#side .fb-line summary b{margin:4px 0}
+#side summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
 @media(max-width:900px){main.shell{flex-direction:column}#side{width:100%;position:static;max-height:none}}
 @media(max-width:640px){.res-head{flex-direction:column;align-items:flex-start}}
 </style>
@@ -550,7 +564,7 @@ function renderQuiz(){
       <div class="foot">${done
         ? (picked === q.ci ? '<span style="color:var(--ok)">✔ 答对了</span>' : '<span style="color:var(--bad)">✘ 答错了，正确答案 ' + L[q.ci] + '</span>')
         : '<span class="meta">点击一个选项作答</span>'}</div>
-      <div class="fb"><input type="text" placeholder="反馈" value="${esc(roundFb(q.id))}" oninput="saveFb('${esc(q.id)}', this.value)"></div>
+      ${feedbackEditor(q.id)}
     </div>
     <div class="qz-actions">
       ${done
@@ -570,7 +584,7 @@ function resultHTML(){
       <div class="t">${esc(q.q)}</div>
       <div class="a" style="color:var(--bad)">我选了：${myTxt}</div>
       <div class="a" style="color:var(--ok)">正确答案：${okTxt}</div>
-      <div class="wb-ops"><input type="text" placeholder="反馈" value="${esc(roundFb(w.id))}" oninput="saveFb('${esc(w.id)}', this.value)"></div>
+      ${feedbackEditor(w.id)}
     </div>`;
   }).join('') : '<p class="meta">全部答对，错题本没有新增。</p>';
   return `<div class="res">
@@ -798,11 +812,21 @@ function exportPlayCsv(){
 const CLOUD_API = 'https://wise-hornet-d3g6sfhoaff010e34.service.tcloudbase.com/quizlog';
 let cloudPlays = [];
 let cloudState = 'loading';            // loading | ok | fail
-const fbSent = new Set();              // 同一条反馈不重复提交
-const fbTimers = {};
+const FB_DRAFT_KEY = 'quiz_feedback_drafts_' + DATA.exportedAt;
+const FB_CONFIRMED_KEY = 'quiz_feedback_confirmed_' + DATA.exportedAt;
+const feedbackDrafts = parseMarks(st.get(FB_DRAFT_KEY));
+const storedFeedback = parseMarks(st.get(FB_CONFIRMED_KEY));
+const confirmedFeedback = Array.isArray(storedFeedback) ? storedFeedback : [];
+const sideExpanded = parseMarks(st.get('quiz_side_expanded_v1'));
+
+function sideToggle(key, open){
+  sideExpanded[key] = open;
+  st.set('quiz_side_expanded_v1', JSON.stringify(sideExpanded));
+}
+function sideOpen(key){ return sideExpanded[key] ? ' open' : ''; }
 
 function cloudLoad(){
-  fetch(CLOUD_API, {method: 'GET'})
+  return fetch(CLOUD_API, {method: 'GET'})
     .then(r => r.json())
     .then(d => {
       if (d && d.ok){ cloudPlays = Array.isArray(d.plays) ? d.plays : []; cloudState = 'ok'; }
@@ -814,13 +838,17 @@ function cloudLoad(){
 function cloudPost(obj){
   // 用 text/plain 发，属于简单请求，不触发预检
   return fetch(CLOUD_API, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(obj)})
-    .then(r => r.json())
+    .then(async r => {
+      const d = await r.json();
+      return r.ok && d && d.ok ? d : null;
+    })
     .catch(() => null);
 }
 function playerName(){ return (quiz && quiz.by) || cur || '匿名'; }
 
 const _finishQuiz = finishQuiz;
 finishQuiz = function(){
+  if (!quiz || quiz.finished) return;
   const r = _finishQuiz.apply(this, arguments);
   if (quiz && quiz.result){
     cloudPost({
@@ -835,20 +863,73 @@ finishQuiz = function(){
   return r;
 };
 
-const _saveFb = saveFb;
+function feedbackKey(id){ return JSON.stringify([roundKey(), playerName(), id]); }
+function feedbackEntry(id){
+  const key = feedbackKey(id);
+  if (!feedbackDrafts[key]) feedbackDrafts[key] = {text: '', submittedText: ''};
+  return feedbackDrafts[key];
+}
+function persistFeedbackDrafts(){
+  const data = {};
+  Object.keys(feedbackDrafts).forEach(key => {
+    const e = feedbackDrafts[key];
+    data[key] = {text: e.text || '', submittedText: e.submittedText || ''};
+  });
+  st.set(FB_DRAFT_KEY, JSON.stringify(data));
+}
+function feedbackState(e){
+  const text = (e.text || '').trim();
+  if (e.pending) return {label: '提交中…', disabled: true, message: '正在上传', error: false};
+  if (text && text === e.submittedText) return {label: '已提交', disabled: true, message: '反馈已上传', error: false};
+  return {label: '确认反馈', disabled: !text, message: e.error || '', error: !!e.error};
+}
+function feedbackEditor(id){
+  const e = feedbackEntry(id), s = feedbackState(e);
+  return `<div class="fb fb-editor" data-fb-id="${esc(id)}">
+    <input type="text" maxlength="300" aria-label="反馈" placeholder="反馈" value="${esc(e.text || '')}" oninput="saveFb('${esc(id)}', this.value)">
+    <button class="tbtn pri"${s.disabled ? ' disabled' : ''} onclick="confirmFeedback('${esc(id)}')">${s.label}</button>
+    <span class="fb-status${s.error ? ' error' : ''}" role="status" aria-live="polite">${esc(s.message)}</span>
+  </div>`;
+}
+function updateFeedbackEditor(id){
+  const s = feedbackState(feedbackEntry(id));
+  document.querySelectorAll('.fb-editor[data-fb-id="' + CSS.escape(id) + '"]').forEach(el => {
+    const button = el.querySelector('button'), status = el.querySelector('.fb-status');
+    button.disabled = s.disabled;
+    button.textContent = s.label;
+    status.textContent = s.message;
+    status.classList.toggle('error', s.error);
+  });
+}
+roundFb = function(id){ return feedbackEntry(id).text || ''; };
 saveFb = function(id, val){
-  const r = _saveFb.apply(this, arguments);
-  const text = String(val || '').trim();
-  clearTimeout(fbTimers[id]);
-  if (!text) return r;
-  fbTimers[id] = setTimeout(() => {          // 等人写完再交，避免一边打字一边提交
-    const key = id + '\n' + text;
-    if (fbSent.has(key)) return;
-    fbSent.add(key);
-    cloudPost({by: playerName(), fb: [{id: id, t: text}]}).then(() => cloudLoad());
-  }, 1500);
-  return r;
+  const e = feedbackEntry(id);
+  e.text = String(val || '').slice(0, 300);
+  e.error = '';
+  persistFeedbackDrafts();
+  updateFeedbackEditor(id);
 };
+async function confirmFeedback(id){
+  const key = feedbackKey(id), e = feedbackEntry(id);
+  const text = (e.text || '').trim();
+  if (!text || e.pending || text === e.submittedText) return;
+  const by = playerName();
+  e.pending = true;
+  e.error = '';
+  updateFeedbackEditor(id);
+  const d = await cloudPost({by: by, fb: [{id: id, t: text}]});
+  e.pending = false;
+  if (d && d.ok){
+    e.submittedText = text;
+    confirmedFeedback.push({id: id, by: by, t: text});
+    st.set(FB_CONFIRMED_KEY, JSON.stringify(confirmedFeedback));
+    persistFeedbackDrafts();
+    await cloudLoad();
+  } else {
+    e.error = '上传失败，草稿已保留，请重试';
+  }
+  if (feedbackKey(id) === key) updateFeedbackEditor(id);
+}
 
 renderSide = function(){
   const el = document.getElementById('side');
@@ -868,16 +949,15 @@ renderSide = function(){
       (byQ[f.id] = byQ[f.id] || []).push({by: p.by || '', t: f.t, at: p.at || ''});
     }));
   } else {
-    Object.keys(play.fb).forEach(id => {
-      collectItems(play.fb[id] || {}).forEach(x => (byQ[id] = byQ[id] || []).push({by: x.by || '', t: x.t}));
-    });
+    confirmedFeedback.forEach(x => (byQ[x.id] = byQ[x.id] || []).push(x));
   }
   const fbIds = Object.keys(byQ).sort((a, b) => a.localeCompare(b, 'zh'));
   const fbHTML = fbIds.map(id => {
     const q = qs.find(x => x.id === id);
     const cat = q && q.cat ? `<span class="qcat">${esc(q.cat)}</span>` : '';
     const lis = byQ[id].map(x => `<li>${x.by ? esc(x.by) + '：' : ''}${esc(x.t)}</li>`).join('');
-    return `<div class="fb-line"><span class="qid">${esc(id)}</span>${cat}<b>${q ? esc(q.q) : ''}</b><ul class="fb-multi">${lis}</ul></div>`;
+    const key = 'question:' + id;
+    return `<details class="fb-line"${sideOpen(key)} ontoggle="sideToggle('${esc(key)}', this.open)"><summary><span class="qid">${esc(id)}</span>${cat}<span class="meta">${byQ[id].length} 条反馈</span><b>${q ? esc(q.q) : ''}</b></summary><ul class="fb-multi">${lis}</ul></details>`;
   }).join('');
 
   if (!rounds.length && !fbHTML && cloudState === 'loading'){ el.hidden = true; el.innerHTML = ''; return; }
@@ -892,8 +972,15 @@ renderSide = function(){
     ? `<div class="meta" style="margin-bottom:6px">共 ${rounds.length} 轮，所有人共享</div>`
     : '<div class="meta" style="margin-bottom:6px;color:var(--bad)">连不上服务器，下面只有本机记录</div>';
 
-  el.innerHTML = `<h3>所有人的答题记录</h3>${tip}${table}
-    <div class="side-note">反馈</div>${fbHTML || '<div class="fb-line" style="color:var(--muted)">还没有反馈。</div>'}`;
+  const feedbackN = fbIds.reduce((n, id) => n + byQ[id].length, 0);
+  el.innerHTML = `<details class="side-section"${sideOpen('records')} ontoggle="sideToggle('records', this.open)">
+      <summary>所有人的答题记录<span class="meta">${rounds.length} 轮</span></summary>
+      <div class="side-content scroll">${tip}${table}</div>
+    </details>
+    <details class="side-section"${sideOpen('feedback')} ontoggle="sideToggle('feedback', this.open)">
+      <summary>反馈<span class="meta">${fbIds.length} 题 · ${feedbackN} 条</span></summary>
+      <div class="side-content scroll">${fbHTML || '<div class="fb-line" style="color:var(--muted)">还没有反馈。</div>'}</div>
+    </details>`;
 };
 
 cloudLoad();
